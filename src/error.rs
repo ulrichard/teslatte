@@ -13,10 +13,19 @@ pub enum TeslatteError {
     #[diagnostic()]
     UnhandledServerError { request: String, body: String },
 
+    #[cfg(feature = "async-interface")]
     #[error("{request} fetch error")]
     #[diagnostic()]
     FetchError {
         source: reqwest::Error,
+        request: String,
+    },
+
+    #[cfg(feature = "blocking-interface")]
+    #[error("{request} fetch error")]
+    #[diagnostic()]
+    FetchError {
+        source: ureq::Error,
         request: String,
     },
 
@@ -28,6 +37,7 @@ pub enum TeslatteError {
         body: String,
     },
 
+    #[cfg(feature = "async-interface")]
     #[error("Unhandled reqwest error.")]
     UnhandledReqwestError(#[source] reqwest::Error),
 

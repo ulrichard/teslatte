@@ -2,3 +2,4 @@
 /Cargo.lock
 cli.json
 .idea
+.cargo/

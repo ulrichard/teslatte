@@ -2,7 +2,10 @@ use crate::error::TeslatteError::{CouldNotFindCallbackCode, CouldNotFindState};
 use crate::{OwnerApi, TeslatteError};
 use derive_more::{Display, FromStr};
 use rand::Rng;
+#[cfg(feature = "async-interface")]
 use reqwest::Client;
+#[cfg(feature = "blocking-interface")]
+use ureq::Agent;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{stdin, stdout, Write};
@@ -124,6 +127,7 @@ page, where the URL will start with https://auth.tesla.com/void/callback?code=..
         Self::auth_post(url, &payload).await
     }
 
+#[cfg(feature = "async-interface")]
     async fn auth_post<'a, S, D>(url: &str, payload: &S) -> Result<D, TeslatteError>
     where
         S: Serialize,
@@ -145,6 +149,39 @@ page, where the URL will start with https://auth.tesla.com/void/callback?code=..
             .await
             .map_err(|source| TeslatteError::FetchError {
                 source,
+                request: url.to_string(),
+            })?;
+
+        let json =
+            serde_json::from_str::<D>(&body).map_err(|source| TeslatteError::DecodeJsonError {
+                source,
+                body: body.to_string(),
+                request: url.to_string(),
+            })?;
+
+        Ok(json)
+    }
+
+#[cfg(feature = "blocking-interface")]
+    async fn auth_post<'a, S, D>(url: &str, payload: &S) -> Result<D, TeslatteError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
+        let response = Agent::new()
+                .post(url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+              .send_json(payload)
+            .map_err(|source| TeslatteError::FetchError {
+                source,
+                request: url.to_string(),
+            })?;
+
+        let body = response
+            .into_string()
+            .map_err(|source| TeslatteError::FetchError {
+                source: source.into(),
                 request: url.to_string(),
             })?;
 

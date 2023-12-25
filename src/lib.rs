@@ -2,6 +2,9 @@
 // TODO: Maybe use the suggestion of removing async and replacing it with Future<Output = Result<...>>
 #![allow(async_fn_in_trait)]
 
+#[cfg(all(feature = "async-interface", feature = "blocking-interface"))]
+compile_error!("Features async-interface and blocking-interface are mutually exclusive and cannot be enabled together");
+
 use crate::auth::{AccessToken, RefreshToken};
 use crate::error::TeslatteError;
 use crate::vehicles::{
@@ -10,7 +13,10 @@ use crate::vehicles::{
 };
 use chrono::{DateTime, SecondsFormat, TimeZone};
 use derive_more::{Deref, Display, From, FromStr};
+#[cfg(feature = "async-interface")]
 use reqwest::Client;
+#[cfg(feature = "blocking-interface")]
+use ureq::Agent;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tracing::debug;
@@ -151,22 +157,33 @@ pub struct OwnerApi {
     pub access_token: AccessToken,
     pub refresh_token: Option<RefreshToken>,
     pub print_responses: PrintResponses,
+#[cfg(feature = "async-interface")]
     client: Client,
+#[cfg(feature = "blocking-interface")]
+    agent: Agent,
 }
 
 impl OwnerApi {
     pub fn new(access_token: AccessToken, refresh_token: Option<RefreshToken>) -> Self {
+        let sec10 = std::time::Duration::from_secs(10);
         Self {
             access_token,
             refresh_token,
             print_responses: PrintResponses::No,
+#[cfg(feature = "async-interface")]
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(sec10)
                 .build()
                 .unwrap(), // TODO: unwrap
+#[cfg(feature = "blocking-interface")]
+            agent: ureq::AgentBuilder::new()
+              .timeout_read(sec10.clone())
+              .timeout_write(sec10)
+              .build(),
         }
     }
 
+#[cfg(feature = "async-interface")]
     async fn get<D>(&self, url: &str) -> Result<D, TeslatteError>
     where
         D: for<'de> Deserialize<'de> + Debug,
@@ -174,6 +191,15 @@ impl OwnerApi {
         self.request(&RequestData::Get { url }).await
     }
 
+#[cfg(feature = "blocking-interface")]
+    fn get<D>(&self, url: &str) -> Result<D, TeslatteError>
+    where
+        D: for<'de> Deserialize<'de> + Debug,
+    {
+        self.request(&RequestData::Get { url })
+    }
+
+#[cfg(feature = "async-interface")]
     async fn post<S>(&self, url: &str, body: S) -> Result<PostResponse, TeslatteError>
     where
         S: Serialize + Debug,
@@ -195,6 +221,29 @@ impl OwnerApi {
         Ok(data)
     }
 
+#[cfg(feature = "blocking-interface")]
+    fn post<S>(&self, url: &str, body: S) -> Result<PostResponse, TeslatteError>
+    where
+        S: Serialize + Debug,
+    {
+        let payload =
+            &serde_json::to_string(&body).expect("Should not fail creating the request struct.");
+        let request_data = RequestData::Post { url, payload };
+        let data = self.request::<PostResponse>(&request_data)?;
+
+        if !data.result {
+            return Err(TeslatteError::ServerError {
+                request: format!("{request_data}"),
+                description: None,
+                msg: data.reason,
+                body: None,
+            });
+        }
+
+        Ok(data)
+    }
+
+#[cfg(feature = "async-interface")]
     async fn request<T>(&self, request_data: &RequestData<'_>) -> Result<T, TeslatteError>
     where
         T: for<'de> Deserialize<'de> + Debug,
@@ -228,6 +277,47 @@ impl OwnerApi {
                 source,
                 request: format!("{request_data}"),
             })?;
+
+        debug!("Response: {response_body}");
+
+        Self::parse_json(request_data, response_body, self.print_responses)
+    }
+
+#[cfg(feature = "blocking-interface")]
+    fn request<T>(&self, request_data: &RequestData<'_>) -> Result<T, TeslatteError>
+    where
+        T: for<'de> Deserialize<'de> + Debug,
+    {
+        debug!("{request_data}");
+
+        let response_body = match request_data {
+            RequestData::Get { url } => self.agent.get(url)
+                .set("Accept", "application/json")
+                .set(
+                    "Authorization",
+                    &format!("Bearer {}", self.access_token.0.trim()),
+                )
+                .call(),
+            RequestData::Post { url, payload } => self
+                .agent
+                .post(*url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+                .set(
+                    "Authorization",
+                    &format!("Bearer {}", self.access_token.0.trim()),
+                )
+              .send_json(payload),
+        }
+        .map_err(|source| TeslatteError::FetchError {
+            source,
+            request: format!("{request_data}"),
+        })?
+        .into_string()
+        .map_err(|source| TeslatteError::FetchError {
+            source: source.into(),
+            request: format!("{request_data}"),
+        })?;
 
         debug!("Response: {response_body}");
 
@@ -318,9 +408,13 @@ macro_rules! get {
     ($name:ident, $return_type:ty, $url:expr) => {
         async fn $name(&self) -> Result<$return_type, crate::error::TeslatteError> {
             let url = format!("{}{}", crate::API_URL, $url);
-            self.get(&url)
+#[cfg(feature = "async-interface")]
+            return self.get(&url)
                 .await
-                .map_err(|e| crate::error::TeslatteError::from(e))
+                .map_err(|e| crate::error::TeslatteError::from(e));
+#[cfg(feature = "blocking-interface")]
+            return self.get(&url)
+                .map_err(|e| crate::error::TeslatteError::from(e));
         }
     };
 }
@@ -331,9 +425,13 @@ macro_rules! pub_get {
     ($name:ident, $return_type:ty, $url:expr) => {
         pub async fn $name(&self) -> Result<$return_type, crate::error::TeslatteError> {
             let url = format!("{}{}", crate::API_URL, $url);
-            self.get(&url)
+#[cfg(feature = "async-interface")]
+            return self.get(&url)
                 .await
-                .map_err(|e| crate::error::TeslatteError::from(e))
+                .map_err(|e| crate::error::TeslatteError::from(e));
+#[cfg(feature = "blocking-interface")]
+            return self.get(&url)
+                .map_err(|e| crate::error::TeslatteError::from(e));
         }
     };
 }
@@ -351,7 +449,10 @@ macro_rules! get_arg {
         ) -> miette::Result<$return_type, crate::error::TeslatteError> {
             let url = format!($url, arg);
             let url = format!("{}{}", crate::API_URL, url);
-            self.get(&url).await
+#[cfg(feature = "async-interface")]
+            return self.get(&url).await;
+#[cfg(feature = "blocking-interface")]
+            return self.get(&url);
         }
     };
 }
@@ -367,7 +468,10 @@ macro_rules! pub_get_arg {
         ) -> miette::Result<$return_type, crate::error::TeslatteError> {
             let url = format!($url, arg);
             let url = format!("{}{}", crate::API_URL, url);
-            self.get(&url).await
+#[cfg(feature = "async-interface")]
+            return self.get(&url).await;
+#[cfg(feature = "blocking-interface")]
+            return self.get(&url);
         }
     };
 }
@@ -382,7 +486,10 @@ macro_rules! get_args {
         ) -> miette::Result<$return_type, crate::error::TeslatteError> {
             let url = values.format($url);
             let url = format!("{}{}", crate::API_URL, url);
-            self.get(&url).await
+#[cfg(feature = "async-interface")]
+            return self.get(&url).await;
+#[cfg(feature = "blocking-interface")]
+            return self.get(&url);
         }
     };
 }
@@ -397,7 +504,10 @@ macro_rules! pub_get_args {
         ) -> miette::Result<$return_type, crate::error::TeslatteError> {
             let url = values.format($url);
             let url = format!("{}{}", crate::API_URL, url);
-            self.get(&url).await
+#[cfg(feature = "async-interface")]
+            return self.get(&url).await;
+#[cfg(feature = "blocking-interface")]
+            return self.get(&url);
         }
     };
 }
@@ -413,7 +523,10 @@ macro_rules! post_arg {
         ) -> miette::Result<crate::PostResponse, crate::error::TeslatteError> {
             let url = format!($url, arg);
             let url = format!("{}{}", crate::API_URL, url);
-            self.post(&url, data).await
+#[cfg(feature = "async-interface")]
+            return self.post(&url, data).await;
+#[cfg(feature = "blocking-interface")]
+            return self.post(&url, data);
         }
     };
 }
@@ -428,7 +541,10 @@ macro_rules! post_arg_empty {
         ) -> miette::Result<crate::PostResponse, crate::error::TeslatteError> {
             let url = format!($url, arg);
             let url = format!("{}{}", crate::API_URL, url);
-            self.post(&url, &Empty {}).await
+#[cfg(feature = "async-interface")]
+            return self.post(&url, &Empty {}).await;
+#[cfg(feature = "blocking-interface")]
+            return self.post(&url, &Empty {});
         }
     };
 }
